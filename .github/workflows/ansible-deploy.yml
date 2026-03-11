@@ -1,0 +1,93 @@
+name: Ansible Deployment
+
+on:
+  push:
+    branches: [ main, master, lab06 ]
+    paths:
+      - 'ansible/**'
+      - '!ansible/docs/**'
+      - '.github/workflows/ansible-deploy.yml'
+  pull_request:
+    branches: [ main, master ]
+    paths:
+      - 'ansible/**'
+      - '!ansible/docs/**'
+
+jobs:
+  lint:
+    name: Ansible Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Ansible and lint
+        run: |
+          pip install ansible ansible-lint
+
+      - name: Install required collections
+        run: |
+          ansible-galaxy collection install -r ansible/requirements.yml
+
+      - name: Write vault password file
+        env:
+          VAULT_PASS: ${{ secrets.ANSIBLE_VAULT_PASSWORD }}
+        run: |
+          printf '%s' "$VAULT_PASS" > ansible/.vault_pass
+          chmod 600 ansible/.vault_pass
+
+      - name: Run ansible-lint
+        run: |
+          cd ansible
+          ansible-lint playbooks/provision.yml playbooks/deploy.yml playbooks/deploy_python.yml
+
+  deploy:
+    name: Deploy Python Application
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Ansible and dependencies
+        run: |
+          pip install ansible
+
+      - name: Install required collections
+        run: |
+          ansible-galaxy collection install -r ansible/requirements.yml
+
+      - name: Setup SSH key
+        env:
+          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.VM_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Create inventory
+        run: |
+          cat > ansible/inventory/hosts.ini << EOF
+          [lab04-vps]
+          ${{ secrets.VM_HOST }} ansible_user=root ansible_ssh_private_key_file=~/.ssh/id_ed25519
+          EOF
+
+      - name: Deploy with Ansible
+        run: |
+          cd ansible
+          printf '%s' "${{ secrets.ANSIBLE_VAULT_PASSWORD }}" > .vault_pass
+          chmod 600 .vault_pass
+          ansible-playbook playbooks/deploy_python.yml \
+            --vault-password-file .vault_pass
+          rm -f .vault_pass
+
+      - name: Verify deployment
+        run: |
+          sleep 10
+          curl -f http://${{ secrets.VM_HOST }}:8000 || exit 1

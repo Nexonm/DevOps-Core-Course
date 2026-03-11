@@ -1,0 +1,18 @@
+---
+# Ansible-lint configuration for CI/CD
+
+# Use minimal profile for CI
+profile: min
+
+# Exclude specific paths
+exclude_paths:
+  - .vault_pass
+  - inventory/
+  - .ansible/
+
+# Enable offline mode (don't check external dependencies)
+offline: true
+
+# Warn on unknown tags instead of failing
+warn_list:
+  - experimental
