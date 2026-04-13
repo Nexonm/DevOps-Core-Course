@@ -1,28 +1,81 @@
-import os
-import socket
-import platform
+import json
 import logging
+import os
+import platform
+import socket
+import time
 from datetime import datetime, timezone
-from typing import List, Dict, Any
+from pathlib import Path
+from threading import Lock
+from typing import Dict, List
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
+from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 
 # Configuration
 HOST = os.getenv('HOST', '0.0.0.0')
 PORT = int(os.getenv('PORT', 8000))
 DEBUG = os.getenv('DEBUG', 'False').lower() == 'true'
+VISITS_LOCK = Lock()
 
-# Logging setup
-logging.basicConfig(
-    level=logging.DEBUG if DEBUG else logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# JSON Logging Formatter
+class JSONFormatter(logging.Formatter):
+    def format(self, record):
+        log_data = {
+            'timestamp': datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+            'level': record.levelname,
+            'message': record.getMessage(),
+            'logger': record.name
+        }
+        if hasattr(record, 'method'):
+            log_data['method'] = record.method
+        if hasattr(record, 'path'):
+            log_data['path'] = record.path
+        if hasattr(record, 'status_code'):
+            log_data['status_code'] = record.status_code
+        if hasattr(record, 'client_ip'):
+            log_data['client_ip'] = record.client_ip
+        return json.dumps(log_data)
+
+# Logging setup with JSON formatter
+handler = logging.StreamHandler()
+handler.setFormatter(JSONFormatter())
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG if DEBUG else logging.INFO)
+logger.addHandler(handler)
+logger.propagate = False
 
 # Application start time
 START_TIME = datetime.now(timezone.utc)
+
+# HTTP metrics — track every request by method, endpoint, and status code
+http_requests_total = Counter(
+    'http_requests_total',
+    'Total HTTP requests',
+    ['method', 'endpoint', 'status_code']
+)
+http_request_duration_seconds = Histogram(
+    'http_request_duration_seconds',
+    'HTTP request duration in seconds',
+    ['method', 'endpoint', 'status_code']
+)
+http_requests_in_progress = Gauge(
+    'http_requests_in_progress',
+    'HTTP requests currently being processed'
+)
+
+# App-specific: counts calls to the system info endpoint (the main business action)
+devops_info_requests_total = Counter(
+    'devops_info_requests_total',
+    'Total calls to the system info endpoint'
+)
+# App-specific: measures how long it takes to collect system information
+devops_info_system_collection_seconds = Histogram(
+    'devops_info_system_collection_seconds',
+    'Time in seconds spent collecting system information'
+)
 
 # Pydantic models
 class ServiceInfo(BaseModel):
@@ -68,6 +121,11 @@ class HealthResponse(BaseModel):
     timestamp: str
     uptime_seconds: int
 
+
+class VisitsResponse(BaseModel):
+    visits: int
+
+
 # FastAPI app
 app = FastAPI(
     title="DevOps Info Service",
@@ -75,8 +133,38 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# Middleware for request/response logging and metrics recording
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    client_ip = request.client.host if request.client else "unknown"
+    method = request.method
+    path = str(request.url.path)
+
+    http_requests_in_progress.inc()
+    start_time = time.time()
+    response = await call_next(request)
+    process_time = time.time() - start_time
+    http_requests_in_progress.dec()
+
+    status_code = str(response.status_code)
+    http_requests_total.labels(method=method, endpoint=path, status_code=status_code).inc()
+    http_request_duration_seconds.labels(method=method, endpoint=path, status_code=status_code).observe(process_time)
+
+    log_record = logger.makeRecord(
+        logger.name, logging.INFO, "", 0,
+        f"{method} {path} {response.status_code}",
+        (), None
+    )
+    log_record.method = method
+    log_record.path = path
+    log_record.status_code = response.status_code
+    log_record.client_ip = client_ip
+    logger.handle(log_record)
+
+    return response
+
 # Helper functions
-def get_uptime() -> Dict[str, Any]:
+def get_uptime() -> Dict[str, object]:
     """Calculate application uptime"""
     delta = datetime.now(timezone.utc) - START_TIME
     seconds = int(delta.total_seconds())
@@ -89,21 +177,70 @@ def get_uptime() -> Dict[str, Any]:
         'human': f"{hours_text}, {minutes_text}"
     }
 
+
+def get_visits_file_path() -> Path:
+    """Return the configured path for the persisted visits counter."""
+    return Path(os.getenv('VISITS_FILE', '/data/visits'))
+
+
+def read_visits_count() -> int:
+    """Read the current visits counter from disk."""
+    visits_file = get_visits_file_path()
+    try:
+        content = visits_file.read_text(encoding='utf-8').strip()
+    except FileNotFoundError:
+        return 0
+
+    if not content:
+        return 0
+
+    try:
+        return int(content)
+    except ValueError:
+        return 0
+
+
+def write_visits_count(count: int) -> None:
+    """Write the visits counter atomically."""
+    visits_file = get_visits_file_path()
+    visits_file.parent.mkdir(parents=True, exist_ok=True)
+    temp_file = visits_file.with_suffix('.tmp')
+    temp_file.write_text(str(count), encoding='utf-8')
+    temp_file.replace(visits_file)
+
+
+def ensure_visits_storage() -> int:
+    """Initialise the visits counter file when it does not exist."""
+    current_count = read_visits_count()
+    if not get_visits_file_path().exists():
+        write_visits_count(current_count)
+    return current_count
+
+
+def increment_visits_count() -> int:
+    """Increment the visits counter safely for the current process."""
+    with VISITS_LOCK:
+        current_count = read_visits_count() + 1
+        write_visits_count(current_count)
+        return current_count
+
+
 def get_system_info() -> SystemInfo:
     """Collect system information"""
-    return SystemInfo(
-        hostname=socket.gethostname(),
-        platform=platform.system(),
-        platform_version=platform.version(),
-        architecture=platform.machine(),
-        cpu_count=os.cpu_count() or 0,
-        python_version=platform.python_version()
-    )
+    with devops_info_system_collection_seconds.time():
+        return SystemInfo(
+            hostname=socket.gethostname(),
+            platform=platform.system(),
+            platform_version=platform.version(),
+            architecture=platform.machine(),
+            cpu_count=os.cpu_count() or 0,
+            python_version=platform.python_version()
+        )
 
 def get_service_info() -> ServiceInfo:
     """Get service metadata"""
     return ServiceInfo(
-        name="devops-info-service",
+        name=os.getenv('APP_NAME', 'devops-info-service'),
         version="1.0.0",
         description="DevOps course info service",
         framework="FastAPI"
@@ -140,6 +277,16 @@ def get_endpoints() -> List[EndpointInfo]:
             path="/health",
             method="GET",
             description="Health check"
+        ),
+        EndpointInfo(
+            path="/visits",
+            method="GET",
+            description="Current persisted visits counter"
+        ),
+        EndpointInfo(
+            path="/metrics",
+            method="GET",
+            description="Prometheus metrics"
         )
     ]
 
@@ -149,9 +296,8 @@ async def root(request: Request):
     """
     Main endpoint - comprehensive service and system information
     """
-    client_host = request.client.host if request.client else 'unknown'
-    logger.info(f"Request: {request.method} {request.url.path} from {client_host}")
-    
+    devops_info_requests_total.inc()
+    increment_visits_count()
     response = MainResponse(
         service=get_service_info(),
         system=get_system_info(),
@@ -159,7 +305,6 @@ async def root(request: Request):
         request=get_request_info(request),
         endpoints=get_endpoints()
     )
-    
     return response
 
 @app.get("/health", response_model=HealthResponse)
@@ -167,14 +312,28 @@ async def health():
     """
     Health check endpoint for monitoring and probes
     """
-    logger.debug("Health check requested")
-    
     uptime = get_uptime()
     return HealthResponse(
         status="healthy",
         timestamp=datetime.now(timezone.utc).isoformat(),
         uptime_seconds=uptime['seconds']
     )
+
+
+@app.get("/visits", response_model=VisitsResponse)
+async def visits():
+    """
+    Return the current persisted visits counter
+    """
+    return VisitsResponse(visits=read_visits_count())
+
+
+@app.get("/metrics")
+async def metrics():
+    """
+    Prometheus metrics endpoint
+    """
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 # Error handlers
 @app.exception_handler(404)
@@ -191,7 +350,17 @@ async def not_found_handler(request: Request, exc):
 @app.exception_handler(500)
 async def internal_error_handler(request: Request, exc):
     """Handle 500 errors"""
-    logger.error(f"Internal error: {exc}")
+    log_record = logger.makeRecord(
+        logger.name, logging.ERROR, "", 0,
+        f"Internal error: {exc}",
+        (), None
+    )
+    log_record.method = request.method
+    log_record.path = str(request.url.path)
+    log_record.status_code = 500
+    log_record.client_ip = request.client.host if request.client else "unknown"
+    logger.handle(log_record)
+
     return JSONResponse(
         status_code=500,
         content={
@@ -204,21 +373,27 @@ async def internal_error_handler(request: Request, exc):
 @app.on_event("startup")
 async def startup_event():
     """Log startup information"""
-    logger.info("=" * 50)
-    logger.info("DevOps Info Service starting...")
-    logger.info(f"Host: {HOST}")
-    logger.info(f"Port: {PORT}")
-    logger.info(f"Debug: {DEBUG}")
-    logger.info(f"Python: {platform.python_version()}")
-    logger.info(f"FastAPI docs: http://{HOST}:{PORT}/docs")
-    logger.info("=" * 50)
+    current_visits = ensure_visits_storage()
+    logger.info("DevOps Info Service starting")
+    logger.info(f"Configuration: host={HOST}, port={PORT}, debug={DEBUG}")
+    logger.info(f"Visits file: {get_visits_file_path()}")
+    logger.info(f"Current visits counter: {current_visits}")
+    logger.info(f"Python version: {platform.python_version()}")
+    logger.info(f"FastAPI docs available at: http://{HOST}:{PORT}/docs")
 
 # Run application
 if __name__ == "__main__":
     import uvicorn
+
+    log_config = uvicorn.config.LOGGING_CONFIG
+    log_config["formatters"]["default"]["fmt"] = "%(message)s"
+    log_config["formatters"]["access"]["fmt"] = "%(message)s"
+
     uvicorn.run(
         app,
         host=HOST,
         port=PORT,
-        log_level="debug" if DEBUG else "info"
+        log_level="debug" if DEBUG else "info",
+        log_config=log_config,
+        access_log=False
     )
